@@ -1,0 +1,578 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from transformers import BertModel
+from my_dataload import CFG, TASK_CONFIG
+
+from sympy.combinatorics import Permutation, PermutationGroup
+import math as math_lib
+
+class EdgeEmbedder(nn.Module):
+    def __init__(self, num_categories, embedding_dim):
+        super(EdgeEmbedder, self).__init__()
+        self.embedding = nn.Embedding(num_categories, embedding_dim, max_norm=None)
+
+    def forward(self, category_indices):
+        embeddings = self.embedding(category_indices)
+        return embeddings
+
+
+def perm_2d(perm):
+    perm_2d_list = [0] * (len(perm)) ** 2
+    for i in range(len(perm)):
+        for j in range(len(perm)):
+            perm_2d_list[i * len(perm) + j] = len(perm) * perm[i] + perm[j]
+    return perm_2d_list
+
+
+def orbit_2d(constructors):
+    n = constructors[0].size
+    perms_2d = []
+    for c in constructors:
+        perms_2d.append(Permutation(perm_2d(list(c))))
+    new_group = PermutationGroup(perms_2d)
+    orbits = new_group.orbits()
+    altered_orbits = []
+    for orbit in orbits:
+        new_orbit = []
+        for i in orbit:
+            new_orbit.append((i // n, i % n))
+        altered_orbits.append(new_orbit)
+    return altered_orbits
+
+
+def compute_closure_perms(n, perms):
+    edge_indices = [(i, j) for i in range(n) for j in range(n)]
+    edge_orbits = orbit_2d(perms)
+    num_categories = len(edge_orbits)
+    edge_to_category = {}
+    for cat_idx, orbit in enumerate(edge_orbits):
+        for edge in orbit:
+            edge_to_category[edge] = cat_idx
+    edge_index = []
+    edge_categories = []
+    for i in range(n):
+        for j in range(n):
+            edge_index.append([i, j])
+            edge_categories.append(edge_to_category[(i, j)])
+    edge_index = torch.tensor(edge_index).t().contiguous()
+    edge_categories = torch.tensor(edge_categories)
+    return num_categories, edge_index, edge_categories
+
+
+class TaskSymmetryGraph:
+    def __init__(self, task_names, task_configs):
+        self.n_tasks = len(task_names)
+        self.task_names = task_names
+        self.task_configs = task_configs
+        self._build_symmetry_groups()
+
+    def _build_symmetry_groups(self):
+        self.task_permutations = {}
+        binary_tasks = [i for i, t in enumerate(self.task_names) 
+                       if self.task_configs[t]['num_classes'] == 2]
+        ternary_tasks = [i for i, t in enumerate(self.task_names) 
+                        if self.task_configs[t]['num_classes'] == 3]
+        polarity_pairs = [('sentiment', 'stance')]
+        for pair in polarity_pairs:
+            if all(t in self.task_names for t in pair):
+                idx1 = self.task_names.index(pair[0])
+                idx2 = self.task_names.index(pair[1])
+                perm = list(range(self.n_tasks))
+                perm[idx1], perm[idx2] = perm[idx2], perm[idx1]
+                self.task_permutations[f'polarity_swap_{pair[0]}_{pair[1]}'] = \
+                    Permutation(perm)
+        if len(binary_tasks) >= 2:
+            for i in range(0, len(binary_tasks) - 1, 2):
+                idx_a, idx_b = binary_tasks[i], binary_tasks[i + 1]
+                perm = list(range(self.n_tasks))
+                perm[idx_a], perm[idx_b] = perm[idx_b], perm[idx_a]
+                self.task_permutations[f'binary_flip_{idx_a}_{idx_b}'] = \
+                    Permutation(perm)
+        identity_perm = Permutation(list(range(self.n_tasks)))
+        self.task_permutations['identity'] = identity_perm
+
+    def get_constructors(self):
+        return list(self.task_permutations.values())
+
+    def compute_closure(self):
+        constructors = self.get_constructors()
+        return compute_closure_perms(self.n_tasks, constructors)
+
+
+class ASENEncoder(nn.Module):
+    def __init__(self, n_nodes, hid_dim, num_layers=2, p_dropout=0.1):
+        super(ASENEncoder, self).__init__()
+        self.n_nodes = n_nodes
+        self.hid_dim = hid_dim
+        self.num_heads = 8
+        self.head_dim = hid_dim // self.num_heads
+
+        self.input_mlp = nn.Sequential(
+            nn.LayerNorm(hid_dim),
+            nn.ReLU(),
+            nn.Linear(hid_dim, hid_dim),
+            nn.LayerNorm(hid_dim)
+        )
+
+        self.conv_layers = nn.ModuleList([
+            nn.MultiheadAttention(hid_dim, self.num_heads, batch_first=True,
+                                 dropout=p_dropout if p_dropout else 0.0)
+            for _ in range(num_layers)
+        ])
+        self.layer_norms = nn.ModuleList([nn.LayerNorm(hid_dim) for _ in range(num_layers)])
+        self.projection_layers = nn.ModuleList([nn.Linear(hid_dim, hid_dim) for _ in range(num_layers)])
+        self.ffns = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(hid_dim, hid_dim * 4),
+                nn.ReLU(),
+                nn.Dropout(p_dropout if p_dropout else 0.0),
+                nn.Linear(hid_dim * 4, hid_dim)
+            ) for _ in range(num_layers)
+        ])
+        self.ffn_norms = nn.ModuleList([nn.LayerNorm(hid_dim) for _ in range(num_layers)])
+
+    def forward(self, x, edge_features=None):
+        h = self.input_mlp(x)
+        for conv, ln, proj, ffn, ffn_ln in zip(
+            self.conv_layers, self.layer_norms, 
+            self.projection_layers, self.ffns, self.ffn_norms
+        ):
+            h_prev = h
+            attn_out, _ = conv(h, h, h)
+            if edge_features is not None:
+                attn_out = attn_out + edge_features.mean(dim=1, keepdim=True).expand_as(attn_out)
+            h = proj(attn_out)
+            h = ln(h)
+            h = F.relu(h)
+            h = h + h_prev
+            ffn_out = ffn(h)
+            h = ffn_ln(h + ffn_out)
+        return h
+
+
+class MultiTaskModel(nn.Module):
+    def __init__(self, task_hidden_dim=768, use_ln=True, asen_num_layers=2):
+        super().__init__()
+
+        self.BertModel = BertModel.from_pretrained(CFG['context_model'])
+        self.sticer_bert = BertModel.from_pretrained(CFG['context_model'])
+
+        self.sticker_cnn = nn.Conv1d(512, 768, kernel_size=1, stride=1, padding=0)
+        self.cross_attention = nn.MultiheadAttention(768, num_heads=12, batch_first=True)
+        self.diff_linear = nn.Linear(768, 768)
+        self.sticker_align = nn.MultiheadAttention(768, num_heads=12, batch_first=True)
+        self.sticker_attention = nn.MultiheadAttention(768, num_heads=12, batch_first=True)
+        self.context_attention = nn.MultiheadAttention(768, num_heads=12, batch_first=True)
+
+        self.fusion_fc = nn.Linear(768 * 5, 768)
+        self.dropout = nn.Dropout(0.1)
+
+        self.task_names = list(TASK_CONFIG.keys())
+        self.num_tasks = len(self.task_names)
+        self.task_hidden_dim = task_hidden_dim
+        self.use_ln = use_ln
+
+        self.symmetry_graph = TaskSymmetryGraph(self.task_names, TASK_CONFIG)
+        self.num_edge_cats, self.edge_index, self.edge_categories = \
+            self.symmetry_graph.compute_closure()
+
+        self.edge_embedder = EdgeEmbedder(self.num_edge_cats, embedding_dim=task_hidden_dim)
+
+        self.asen_encoder = ASENEncoder(
+            n_nodes=self.num_tasks,
+            hid_dim=task_hidden_dim,
+            num_layers=asen_num_layers,
+            p_dropout=0.1
+        )
+
+        self.task_heads = nn.ModuleDict()
+        for task_name, cfg in TASK_CONFIG.items():
+            self.task_heads[task_name] = nn.Sequential(
+                nn.Linear(task_hidden_dim, task_hidden_dim // 2),
+                nn.ReLU(),
+                nn.Dropout(0.1),
+                nn.Linear(task_hidden_dim // 2, cfg['num_classes']),
+            )
+
+        if use_ln:
+            self.output_norm = nn.LayerNorm(task_hidden_dim)
+        else:
+            self.output_norm = None
+
+    def set_epoch(self, epoch):
+        pass
+
+    def get_param_groups(self, base_lr):
+        bert_params = []
+        fusion_params = []
+        asen_params = []
+        edge_embedder_params = []
+        head_params = []
+
+        for name, param in self.named_parameters():
+            if not param.requires_grad:
+                continue
+            if 'BertModel' in name or 'sticer_bert' in name:
+                bert_params.append(param)
+            elif 'edge_embedder' in name:
+                edge_embedder_params.append(param)
+            elif 'asen_encoder' in name:
+                asen_params.append(param)
+            elif 'task_heads' in name:
+                head_params.append(param)
+            else:
+                fusion_params.append(param)
+
+        return [
+            {'params': bert_params, 'lr': base_lr * 0.05},
+            {'params': fusion_params, 'lr': base_lr},
+            {'params': asen_params, 'lr': base_lr * 2},
+            {'params': edge_embedder_params, 'lr': base_lr * 5},
+            {'params': head_params, 'lr': base_lr * 3},
+        ]
+
+
+
+    def encode_shared(self, context_ids, context_masks, token_type_ids,
+                       sticker_txt_ids, sticertext_masks, stickertext_type_ids,
+                       sticker_features):
+        E_X = self.BertModel(input_ids=context_ids, attention_mask=context_masks,
+                             token_type_ids=token_type_ids).last_hidden_state
+        E_S = self.sticer_bert(input_ids=sticker_txt_ids, attention_mask=sticertext_masks,
+                               token_type_ids=stickertext_type_ids).last_hidden_state
+        E_I = sticker_features.float().unsqueeze(1).transpose(1, 2)
+        E_I = self.sticker_cnn(E_I).transpose(1, 2)
+
+        E_IS = torch.cat([E_I, E_S], dim=1)
+        O_MHA, _ = self.cross_attention(query=E_X, key=E_IS, value=E_IS)
+        V_diff = self.diff_linear(O_MHA - E_X)
+        E_S_align, _ = self.sticker_align(query=E_X, key=E_S, value=E_S)
+        O_S, _ = self.sticker_attention(query=E_S_align, key=E_S_align, value=O_MHA)
+        O_X, _ = self.context_attention(query=E_X, key=E_X, value=O_MHA)
+
+        E_X_cls = E_X[:, 0]
+        V_diff_cls = V_diff[:, 0]
+        O_X_cls = O_X[:, 0]
+        E_IS_pool = E_IS.mean(dim=1)
+        O_S_pool = O_S.mean(dim=1)
+
+        E_combined = torch.cat([E_IS_pool, E_X_cls, V_diff_cls, O_S_pool, O_X_cls], dim=-1)
+        E_combined = self.dropout(E_combined)
+        E_combined = self.fusion_fc(E_combined)
+        E_combined = torch.tanh(E_combined)
+        return E_combined
+
+    def forward(self, context_ids, context_masks, token_type_ids,
+                sticker_txt_ids, sticertext_masks, stickertext_type_ids,
+                sticker_features, labels_dict=None):
+        shared_feature = self.encode_shared(
+            context_ids, context_masks, token_type_ids,
+            sticker_txt_ids, sticertext_masks, stickertext_type_ids,
+            sticker_features
+        )
+
+        batch_size = shared_feature.size(0)
+        task_node_features = shared_feature.unsqueeze(1).expand(-1, self.num_tasks, -1)
+
+        edge_feat = self.edge_embedder(
+            self.edge_categories.to(shared_feature.device)
+        ).unsqueeze(0).expand(batch_size, -1, -1)
+
+        equivariant_features = self.asen_encoder(task_node_features, edge_feat)
+
+        if self.output_norm is not None:
+            equivariant_features = self.output_norm(equivariant_features)
+
+        logits = {}
+        for task_idx, task_name in enumerate(self.task_names):
+            task_feat = equivariant_features[:, task_idx, :]
+            logits[task_name] = self.task_heads[task_name](task_feat)
+
+        if labels_dict is not None:
+            task_losses = {}
+            for task_name in self.task_names:
+                target = labels_dict[task_name]
+                task_losses[task_name] = F.cross_entropy(logits[task_name], target)
+            return task_losses, logits
+        else:
+            return logits
+
+
+# ===================== 辅助类保持不变 =====================
+class Conv1D(nn.Module):
+    def __init__(self, in_dim, out_dim, kernel_size=1, stride=1, padding=0, bias=True):
+        super(Conv1D, self).__init__()
+        self.conv1d = nn.Conv1d(in_channels=in_dim, out_channels=out_dim, kernel_size=kernel_size, padding=padding,
+                                stride=stride, bias=bias)
+
+    def forward(self, x):
+        x = x.transpose(1, 2)
+        x = self.conv1d(x)
+        return x.transpose(1, 2)
+
+
+def mask_logits(inputs, mask, mask_value=-1e30):
+    mask = mask.type(torch.float32)
+    return inputs + (1.0 - mask) * mask_value
+
+
+class CSFusion(nn.Module):
+    def __init__(self, dim, drop_rate=0.0):
+        super(CSFusion, self).__init__()
+        w4C = torch.empty(dim, 1)
+        w4S = torch.empty(dim, 1)
+        w4mlu = torch.empty(1, 1, dim)
+        nn.init.xavier_uniform_(w4C)
+        nn.init.xavier_uniform_(w4S)
+        nn.init.xavier_uniform_(w4mlu)
+        self.w4C = nn.Parameter(w4C, requires_grad=True)
+        self.w4S = nn.Parameter(w4S, requires_grad=True)
+        self.w4mlu = nn.Parameter(w4mlu, requires_grad=True)
+        self.dropout = nn.Dropout(p=drop_rate)
+        self.cs_linear = Conv1D(in_dim=4 * dim, out_dim=dim, kernel_size=1, stride=1, padding=0, bias=True)
+        self.cnn0 = nn.Conv1d(768, 11, kernel_size=1, stride=1, padding=0)
+        self.cnn1 = nn.Conv1d(768, 50, kernel_size=1, stride=1, padding=0)
+        self.attention = nn.MultiheadAttention(embed_dim=768, num_heads=12, batch_first=True)
+
+    def forward(self, context, sticker, c_mask, s_mask):
+        score = self.cs_attention(context, sticker)
+        score_ = nn.Softmax(dim=2)(mask_logits(score, s_mask.unsqueeze(1)))
+        score_t = nn.Softmax(dim=1)(mask_logits(score, c_mask.unsqueeze(2)))
+        score_t = score_t.transpose(1, 2)
+        c2s = torch.matmul(score_, sticker)
+        s2c = torch.matmul(torch.matmul(score_, score_t), context)
+        output = torch.cat([context, c2s, torch.mul(context, c2s), torch.mul(context, s2c)], dim=2)
+        output = self.cs_linear(output)
+        return output
+
+    def cs_attention(self, context, sticker):
+        context = self.dropout(context)
+        sticker = self.dropout(sticker)
+        subres0 = self.cnn0(context.transpose(1, 2)).transpose(1, 2)
+        subres1 = self.cnn1(sticker.transpose(1, 2))
+        subres2 = self.attention(context, sticker, sticker)[0]
+        subres2 = self.cnn0(subres2.transpose(1, 2)).transpose(1, 2)
+        return subres0 + subres1 + subres2
+
+
+class FC(nn.Module):
+    def __init__(self, in_size, out_size, dropout_r=0., use_relu=True):
+        super(FC, self).__init__()
+        self.dropout_r = dropout_r
+        self.use_relu = use_relu
+        self.linear = nn.Linear(in_size, out_size)
+        if use_relu:
+            self.relu = nn.ReLU(inplace=True)
+        if dropout_r > 0:
+            self.dropout = nn.Dropout(dropout_r)
+
+    def forward(self, x):
+        x = self.linear(x)
+        if self.use_relu:
+            x = self.relu(x)
+        if self.dropout_r > 0:
+            x = self.dropout(x)
+        return x
+
+
+class MLP(nn.Module):
+    def __init__(self, in_size, mid_size, out_size, dropout_r=0., use_relu=True):
+        super(MLP, self).__init__()
+        self.fc = FC(in_size, mid_size, dropout_r=dropout_r, use_relu=use_relu)
+        self.linear = nn.Linear(mid_size, out_size)
+
+    def forward(self, x):
+        return self.linear(self.fc(x))
+
+
+class LayerNorm1(nn.Module):
+    def __init__(self, size, eps=1e-6):
+        super(LayerNorm1, self).__init__()
+        self.eps = eps
+        self.a_2 = nn.Parameter(torch.ones(size))
+        self.b_2 = nn.Parameter(torch.zeros(size))
+
+    def forward(self, x):
+        mean = x.mean(-1, keepdim=True)
+        std = x.std(-1, keepdim=True)
+        return self.a_2 * (x - mean) / (std + self.eps) + self.b_2
+
+
+class AttFlat(nn.Module):
+    def __init__(self):
+        super(AttFlat, self).__init__()
+        self.mlp = MLP(in_size=768, mid_size=768, out_size=768, dropout_r=0.1, use_relu=True)
+        self.linear_merge = nn.Linear(768 * 1, 768)
+
+    def forward(self, x, x_mask):
+        att = self.mlp(x)
+        x_mask = x_mask.bool().unsqueeze(2)
+        att = att.masked_fill(~x_mask, value=torch.tensor(-1e9, dtype=att.dtype))
+        att = F.softmax(att, dim=1)
+        att_list = []
+        for i in range(768):
+            a = att[:, :, i: i + 1]
+            b = a * x
+            c = torch.sum(b, dim=1)
+            att_list.append(c.unsqueeze(2))
+        x_atted = torch.cat(att_list, dim=2)
+        return self.linear_merge(x_atted)
+
+
+class MHAtt(nn.Module):
+    def __init__(self):
+        super(MHAtt, self).__init__()
+        self.linear_v = nn.Linear(768, 768)
+        self.linear_k = nn.Linear(768, 768)
+        self.linear_q = nn.Linear(768, 768)
+        self.linear_merge = nn.Linear(768, 768)
+        self.dropout = nn.Dropout(0.1)
+
+    def forward(self, v, k, q, mask):
+        n_batches = q.size(0)
+        v = self.linear_v(v).view(n_batches, -1, 8, 96).transpose(1, 2)
+        k = self.linear_k(k).view(n_batches, -1, 8, 96).transpose(1, 2)
+        q = self.linear_q(q).view(n_batches, -1, 8, 96).transpose(1, 2)
+        atted = self.att(v, k, q, mask)
+        atted = atted.transpose(1, 2).contiguous().view(n_batches, -1, 768)
+        return self.linear_merge(atted)
+
+    def att(self, value, key, query, mask):
+        d_k = query.size(-1)
+        scores = torch.matmul(query, key.transpose(-2, -1)) / math.sqrt(d_k)
+        if mask is not None:
+            scores = scores.masked_fill(~(mask.unsqueeze(1).unsqueeze(2).bool()), value=torch.tensor(-1e9, dtype=scores.dtype))
+        att_map = F.softmax(scores, dim=-1)
+        att_map = self.dropout(att_map)
+        if not att_map.size(3) == value.size(2):
+            value = value.expand(value.size(0), value.size(1), att_map.size(3), value.size(3))
+        return torch.matmul(att_map, value)
+
+
+class FFN(nn.Module):
+    def __init__(self):
+        super(FFN, self).__init__()
+        self.mlp = MLP(in_size=768, mid_size=768 * 4, out_size=768, dropout_r=0.1, use_relu=True)
+
+    def forward(self, x):
+        return self.mlp(x)
+
+
+class SA(nn.Module):
+    def __init__(self):
+        super(SA, self).__init__()
+        self.mhatt = MHAtt()
+        self.ffn = FFN()
+        self.dropout1 = nn.Dropout(0.1)
+        self.norm1 = LayerNorm1(768)
+        self.dropout2 = nn.Dropout(0.1)
+        self.norm2 = LayerNorm1(768)
+
+    def forward(self, x, x_mask):
+        x = self.norm1(x + self.dropout1(self.mhatt(x, x, x, x_mask)))
+        x = self.norm2(x + self.dropout2(self.ffn(x)))
+        return x
+
+
+class SGA(nn.Module):
+    def __init__(self):
+        super(SGA, self).__init__()
+        self.mhatt1 = MHAtt()
+        self.mhatt2 = MHAtt()
+        self.ffn = FFN()
+        self.dropout1 = nn.Dropout(0.1)
+        self.norm1 = LayerNorm1(768)
+        self.dropout2 = nn.Dropout(0.1)
+        self.norm2 = LayerNorm1(768)
+        self.dropout3 = nn.Dropout(0.1)
+        self.norm3 = LayerNorm1(768)
+
+    def forward(self, x, y, x_mask, y_mask):
+        x = self.norm1(x + self.dropout1(self.mhatt1(x, x, x, x_mask)))
+        x = self.norm2(x + self.dropout2(self.mhatt2(y, y, x, y_mask)))
+        x = self.norm3(x + self.dropout3(self.ffn(x)))
+        return x
+
+
+class VLC(nn.Module):
+    def __init__(self):
+        super(VLC, self).__init__()
+        self.enc_list = nn.ModuleList([SA() for _ in range(6)])
+        self.dec_lang_frames_list = nn.ModuleList([SGA() for _ in range(6)])
+        self.dec_lang_clips_list = nn.ModuleList([SGA() for _ in range(6)])
+
+    def forward(self, x, y, z, x_mask, y_mask, z_mask):
+        for enc in self.enc_list:
+            x = enc(x, x_mask)
+        for dec in self.dec_lang_frames_list:
+            y = dec(y, x, y_mask, x_mask)
+        for dec in self.dec_lang_clips_list:
+            z = dec(z, x, z_mask, x_mask)
+        return x, y, z
+
+
+import math
+
+class SingleTaskModel(nn.Module):
+    """
+    单任务基线（无 TPG）：
+    保留原 MultiTaskModel 的共享编码器与融合结构，
+    移除所有 TPG 部件（原型、图传播、门控、层归一化、gamma 等），
+    并将多任务分类头替换为单一分类头。
+    """
+    def __init__(self, num_classes):
+        super().__init__()
+        # ---------- 共享编码器（与 MultiTaskModel 完全相同）----------
+        self.BertModel = BertModel.from_pretrained(CFG['context_model'])
+        self.sticer_bert = BertModel.from_pretrained(CFG['context_model'])
+
+        self.sticker_cnn = nn.Conv1d(512, 768, kernel_size=1, stride=1, padding=0)
+        self.cross_attention = nn.MultiheadAttention(768, num_heads=12, batch_first=True)
+        self.diff_linear = nn.Linear(768, 768)
+        self.sticker_align = nn.MultiheadAttention(768, num_heads=12, batch_first=True)
+        self.sticker_attention = nn.MultiheadAttention(768, num_heads=12, batch_first=True)
+        self.context_attention = nn.MultiheadAttention(768, num_heads=12, batch_first=True)
+
+        self.fusion_fc = nn.Linear(768 * 5, 768)
+        self.dropout = nn.Dropout(0.1)
+
+        # ---------- 单任务分类头 ----------
+        self.classifier = nn.Linear(768, num_classes)
+
+    def forward(self, context_ids, context_masks, token_type_ids,
+                sticker_txt_ids, sticertext_masks, stickertext_type_ids,
+                sticker_features, labels=None):
+        # ---- 共享编码 ----
+        E_X = self.BertModel(input_ids=context_ids, attention_mask=context_masks,
+                             token_type_ids=token_type_ids).last_hidden_state
+        E_S = self.sticer_bert(input_ids=sticker_txt_ids, attention_mask=sticertext_masks,
+                               token_type_ids=stickertext_type_ids).last_hidden_state
+        E_I = sticker_features.float().unsqueeze(1).transpose(1, 2)
+        E_I = self.sticker_cnn(E_I).transpose(1, 2)
+
+        E_IS = torch.cat([E_I, E_S], dim=1)
+        O_MHA, _ = self.cross_attention(query=E_X, key=E_IS, value=E_IS)
+        V_diff = self.diff_linear(O_MHA - E_X)
+        E_S_align, _ = self.sticker_align(query=E_X, key=E_S, value=E_S)
+        O_S, _ = self.sticker_attention(query=E_S_align, key=E_S_align, value=O_MHA)
+        O_X, _ = self.context_attention(query=E_X, key=E_X, value=O_MHA)
+
+        E_X_cls = E_X[:, 0]
+        V_diff_cls = V_diff[:, 0]
+        O_X_cls = O_X[:, 0]
+        E_IS_pool = E_IS.mean(dim=1)
+        O_S_pool = O_S.mean(dim=1)
+
+        E_combined = torch.cat([E_IS_pool, E_X_cls, V_diff_cls, O_S_pool, O_X_cls], dim=-1)
+        E_combined = self.dropout(E_combined)
+        E_combined = self.fusion_fc(E_combined)
+        E_combined = torch.tanh(E_combined)      # [B, 768]
+
+        # ---- 单任务分类 ----
+        logits = self.classifier(E_combined)
+
+        if labels is not None:
+            loss = F.cross_entropy(logits, labels)
+            return loss, logits
+        return logits
